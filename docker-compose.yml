@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: civil-scheduler-api
+    ports:
+      # 宿主机端口可用 PORT 覆盖（默认 8000）；容器内服务固定监听 8000
+      - "${PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
