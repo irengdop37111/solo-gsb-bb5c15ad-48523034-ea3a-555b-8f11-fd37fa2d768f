@@ -804,3 +804,188 @@ class ReceiptWriteOffResponse(BaseModel):
     @classmethod
     def _coerce(cls, v: object) -> object:
         return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+# ---------------------------------------------------------------------------
+# 限量活动候补席位试算
+# ---------------------------------------------------------------------------
+
+MAX_WAITLIST_CANDIDATES = 500
+MAX_WAITLIST_EVENTS = 5000
+MAX_WAITLIST_SEATS = 1000
+# 邀请保留时长上限：366 天（分钟）
+MAX_INVITE_TTL_MINUTES = 366 * 1440
+
+
+def _require_z_suffix_value(v: object) -> object:
+    """时刻必须是以 Z 结尾的 UTC ISO 8601 字符串。"""
+    if isinstance(v, str) and not v.endswith("Z"):
+        raise ValueError("must be an ISO 8601 UTC timestamp ending with 'Z'")
+    return v
+
+
+def _normalize_utc_minute(v: datetime) -> datetime:
+    """归一化为 UTC，并要求整分钟（秒与微秒均为 0）。"""
+    if v.tzinfo is None or v.utcoffset() is None:
+        raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
+    v = v.astimezone(timezone.utc)
+    if v.second != 0 or v.microsecond != 0:
+        raise ValueError("must be a whole-minute UTC timestamp (seconds must be 0)")
+    return v
+
+
+class WaitlistCandidateIn(BaseModel):
+    """一名候补者：唯一编号、优先级与报名时刻（不晚于起始时刻）。"""
+
+    candidate_id: str = Field(..., min_length=1, description="候补者编号，非空，请求内唯一")
+    priority: int = Field(..., description="优先级，整数；数值大者优先")
+    registered_at_utc: datetime = Field(
+        ..., description="报名时刻（整分钟 UTC，不晚于起始时刻），ISO 8601 且以 Z 结尾"
+    )
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _strip_candidate_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("candidate_id must not be empty or whitespace")
+        return v
+
+    @field_validator("registered_at_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        return _require_z_suffix_value(v)
+
+    @field_validator("registered_at_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        return _normalize_utc_minute(v)
+
+
+class WaitlistEventIn(BaseModel):
+    """一个确认 / 取消事件：对象编号与发生时刻（整分钟 UTC）。"""
+
+    type: Literal["confirm", "cancel"] = Field(
+        ..., description="事件类型：confirm（确认）或 cancel（取消）"
+    )
+    candidate_id: str = Field(..., min_length=1, description="事件对象（候补者编号）")
+    at_utc: datetime = Field(
+        ..., description="事件发生时刻（整分钟 UTC），ISO 8601 且以 Z 结尾"
+    )
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _strip_candidate_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("candidate_id must not be empty or whitespace")
+        return v
+
+    @field_validator("at_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        return _require_z_suffix_value(v)
+
+    @field_validator("at_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        return _normalize_utc_minute(v)
+
+
+class WaitlistTrialRequest(BaseModel):
+    seats: int = Field(..., ge=1, le=MAX_WAITLIST_SEATS, description="席位数，正整数")
+    invite_ttl_minutes: int = Field(
+        ...,
+        ge=1,
+        le=MAX_INVITE_TTL_MINUTES,
+        description="邀请保留分钟数，正整数；截止时刻 = 发出 + 该分钟数",
+    )
+    start_at_utc: datetime = Field(
+        ..., description="起始时刻（整分钟 UTC），ISO 8601 且以 Z 结尾"
+    )
+    settle_at_utc: datetime = Field(
+        ..., description="结算时刻（整分钟 UTC，不早于起始时刻），ISO 8601 且以 Z 结尾"
+    )
+    candidates: list[WaitlistCandidateIn] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_WAITLIST_CANDIDATES,
+        description=f"候补者，1～{MAX_WAITLIST_CANDIDATES} 名，编号唯一",
+    )
+    events: list[WaitlistEventIn] = Field(
+        default_factory=list,
+        max_length=MAX_WAITLIST_EVENTS,
+        description=(
+            "按时刻非递减排列的确认 / 取消事件（可空），"
+            "时刻须落在 [起始时刻, 结算时刻] 内"
+        ),
+    )
+
+    @field_validator("start_at_utc", "settle_at_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        return _require_z_suffix_value(v)
+
+    @field_validator("start_at_utc", "settle_at_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        return _normalize_utc_minute(v)
+
+    @model_validator(mode="after")
+    def _validate_trial(self) -> "WaitlistTrialRequest":
+        if self.settle_at_utc < self.start_at_utc:
+            raise ValueError("settle_at_utc must be on or after start_at_utc")
+        ids = [c.candidate_id for c in self.candidates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("candidate_id values must be unique")
+        for c in self.candidates:
+            if c.registered_at_utc > self.start_at_utc:
+                raise ValueError(
+                    "registered_at_utc must not be later than start_at_utc"
+                )
+        previous: datetime | None = None
+        for ev in self.events:
+            if ev.at_utc < self.start_at_utc or ev.at_utc > self.settle_at_utc:
+                raise ValueError(
+                    "event at_utc must be within [start_at_utc, settle_at_utc]"
+                )
+            if previous is not None and ev.at_utc < previous:
+                raise ValueError("events must be ordered by non-decreasing at_utc")
+            previous = ev.at_utc
+        return self
+
+
+class WaitlistInvitationOut(BaseModel):
+    candidate_id: str = Field(..., description="被邀请的候补者编号")
+    issued_at_utc: str = Field(..., description="邀请发出时刻，UTC，Z 结尾")
+    deadline_utc: str = Field(
+        ..., description="截止时刻（该分钟仍可确认，下一分钟自动失效），UTC，Z 结尾"
+    )
+    result: str = Field(
+        ..., description="邀请结果：confirmed / expired / cancelled / pending"
+    )
+    resolved_at_utc: str | None = Field(
+        ..., description="结果确定时刻（确认 / 失效 / 取消发生的分钟），UTC，Z 结尾；pending 时为 null"
+    )
+
+
+class WaitlistCandidateOut(BaseModel):
+    candidate_id: str = Field(..., description="候补者编号")
+    status: str = Field(
+        ...,
+        description="最终状态：waiting（待邀）/ invited（持邀）/ confirmed（已确认）/ cancelled（已取消）/ expired（已失效）",
+    )
+
+
+class WaitlistTrialResponse(BaseModel):
+    seats: int = Field(..., description="席位数（回显）")
+    invite_ttl_minutes: int = Field(..., description="邀请保留分钟数（回显）")
+    start_at_utc: str = Field(..., description="起始时刻（回显），UTC，Z 结尾")
+    settle_at_utc: str = Field(..., description="结算时刻（回显），UTC，Z 结尾")
+    invitation_count: int = Field(..., description="发出的邀请总数")
+    invitations: list[WaitlistInvitationOut] = Field(
+        ..., description="全部邀请（发出 / 截止时刻与结果），按发出顺序"
+    )
+    candidates: list[WaitlistCandidateOut] = Field(
+        ..., description="每人的最终状态，按候补者输入顺序"
+    )

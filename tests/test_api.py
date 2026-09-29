@@ -2946,3 +2946,266 @@ def test_write_off_non_finite_amount_422():
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422, token
+
+# ---------------------------------------------------------------------------
+# /waitlist-trial：限量活动候补席位试算
+# ---------------------------------------------------------------------------
+
+_WL_CANDIDATES = [
+    {"candidate_id": "c01", "priority": 5, "registered_at_utc": "2026-04-01T09:00:00Z"},
+    {"candidate_id": "c02", "priority": 5, "registered_at_utc": "2026-04-01T09:10:00Z"},
+    {"candidate_id": "c03", "priority": 7, "registered_at_utc": "2026-04-01T09:50:00Z"},
+    {"candidate_id": "c04", "priority": 1, "registered_at_utc": "2026-04-01T08:00:00Z"},
+]
+
+_WL_BASE = {
+    "seats": 2,
+    "invite_ttl_minutes": 30,
+    "start_at_utc": "2026-04-01T10:00:00Z",
+    "settle_at_utc": "2026-04-01T12:00:00Z",
+    "candidates": _WL_CANDIDATES,
+    "events": [
+        {"type": "confirm", "candidate_id": "c03", "at_utc": "2026-04-01T10:05:00Z"},
+        {"type": "cancel", "candidate_id": "c03", "at_utc": "2026-04-01T10:45:00Z"},
+        {"type": "confirm", "candidate_id": "c04", "at_utc": "2026-04-01T11:10:00Z"},
+    ],
+}
+
+
+def _wl(**overrides):
+    payload = {**_WL_BASE, **overrides}
+    return client.post("/waitlist-trial", json=payload)
+
+
+def test_waitlist_trial_full_scenario():
+    resp = _wl()
+    assert resp.status_code == 200
+    body = resp.json()
+    # 回显
+    assert body["seats"] == 2
+    assert body["invite_ttl_minutes"] == 30
+    assert body["start_at_utc"] == "2026-04-01T10:00:00Z"
+    assert body["settle_at_utc"] == "2026-04-01T12:00:00Z"
+    # 候补顺序 c03(p7) > c01(p5,09:00) > c02(p5,09:10) > c04(p1)，起始邀 c03、c01
+    assert body["invitation_count"] == 4
+    assert body["invitations"] == [
+        {
+            "candidate_id": "c03",
+            "issued_at_utc": "2026-04-01T10:00:00Z",
+            "deadline_utc": "2026-04-01T10:30:00Z",
+            "result": "confirmed",
+            "resolved_at_utc": "2026-04-01T10:05:00Z",
+        },
+        {
+            "candidate_id": "c01",
+            "issued_at_utc": "2026-04-01T10:00:00Z",
+            "deadline_utc": "2026-04-01T10:30:00Z",
+            "result": "expired",
+            "resolved_at_utc": "2026-04-01T10:31:00Z",
+        },
+        {
+            "candidate_id": "c02",
+            "issued_at_utc": "2026-04-01T10:31:00Z",
+            "deadline_utc": "2026-04-01T11:01:00Z",
+            "result": "expired",
+            "resolved_at_utc": "2026-04-01T11:02:00Z",
+        },
+        {
+            "candidate_id": "c04",
+            "issued_at_utc": "2026-04-01T10:45:00Z",
+            "deadline_utc": "2026-04-01T11:15:00Z",
+            "result": "confirmed",
+            "resolved_at_utc": "2026-04-01T11:10:00Z",
+        },
+    ]
+    # 最终状态按候补者输入顺序
+    assert body["candidates"] == [
+        {"candidate_id": "c01", "status": "expired"},
+        {"candidate_id": "c02", "status": "expired"},
+        {"candidate_id": "c03", "status": "cancelled"},
+        {"candidate_id": "c04", "status": "confirmed"},
+    ]
+
+
+def test_waitlist_trial_no_events_pending_and_waiting():
+    resp = _wl(
+        seats=1,
+        settle_at_utc="2026-04-01T10:20:00Z",
+        events=[],
+        candidates=[
+            {"candidate_id": "a", "priority": 1, "registered_at_utc": "2026-04-01T09:00:00Z"},
+            {"candidate_id": "b", "priority": 1, "registered_at_utc": "2026-04-01T09:01:00Z"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["invitations"] == [
+        {
+            "candidate_id": "a",
+            "issued_at_utc": "2026-04-01T10:00:00Z",
+            "deadline_utc": "2026-04-01T10:30:00Z",
+            "result": "pending",
+            "resolved_at_utc": None,
+        }
+    ]
+    assert body["candidates"] == [
+        {"candidate_id": "a", "status": "invited"},
+        {"candidate_id": "b", "status": "waiting"},
+    ]
+
+
+def test_waitlist_trial_confirm_on_deadline_minute_ok():
+    resp = _wl(
+        seats=1,
+        candidates=[
+            {"candidate_id": "a", "priority": 1, "registered_at_utc": "2026-04-01T09:00:00Z"}
+        ],
+        events=[{"type": "confirm", "candidate_id": "a", "at_utc": "2026-04-01T10:30:00Z"}],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["candidates"] == [{"candidate_id": "a", "status": "confirmed"}]
+
+
+def test_waitlist_trial_confirm_after_expiry_409():
+    # 10:31 自动失效先于同刻事件：确认无有效邀请，整批拒绝
+    resp = _wl(
+        seats=1,
+        candidates=[
+            {"candidate_id": "a", "priority": 1, "registered_at_utc": "2026-04-01T09:00:00Z"},
+            {"candidate_id": "b", "priority": 1, "registered_at_utc": "2026-04-01T09:01:00Z"},
+        ],
+        events=[{"type": "confirm", "candidate_id": "a", "at_utc": "2026-04-01T10:31:00Z"}],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "no_valid_invitation",
+        "candidate_id": "a",
+        "event_index": 0,
+        "at_utc": "2026-04-01T10:31:00Z",
+        "reason": "already_exited",
+    }
+
+
+def test_waitlist_trial_confirm_waiting_or_unknown_409():
+    # 待邀者确认
+    resp = _wl(
+        seats=1,
+        events=[{"type": "confirm", "candidate_id": "c01", "at_utc": "2026-04-01T10:05:00Z"}],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_invited"
+    # 未知编号确认
+    resp = _wl(
+        seats=1,
+        events=[{"type": "confirm", "candidate_id": "ghost", "at_utc": "2026-04-01T10:05:00Z"}],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_found"
+
+
+def test_waitlist_trial_double_confirm_409():
+    resp = _wl(
+        seats=2,
+        events=[
+            {"type": "confirm", "candidate_id": "c03", "at_utc": "2026-04-01T10:05:00Z"},
+            {"type": "confirm", "candidate_id": "c03", "at_utc": "2026-04-01T10:06:00Z"},
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "no_valid_invitation"
+    assert detail["reason"] == "already_confirmed"
+    assert detail["event_index"] == 1
+
+
+def test_waitlist_trial_cancel_unknown_or_exited_409():
+    # 未知编号取消
+    resp = _wl(
+        events=[{"type": "cancel", "candidate_id": "ghost", "at_utc": "2026-04-01T10:05:00Z"}]
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "cancel_target_invalid",
+        "candidate_id": "ghost",
+        "event_index": 0,
+        "at_utc": "2026-04-01T10:05:00Z",
+        "reason": "not_found",
+    }
+    # 重复取消同一对象（已退出）
+    resp = _wl(
+        events=[
+            {"type": "cancel", "candidate_id": "c01", "at_utc": "2026-04-01T10:05:00Z"},
+            {"type": "cancel", "candidate_id": "c01", "at_utc": "2026-04-01T10:06:00Z"},
+        ]
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "cancel_target_invalid"
+    assert detail["reason"] == "already_exited"
+    assert detail["event_index"] == 1
+
+
+def test_waitlist_trial_rejection_is_atomic_no_partial_result():
+    # 前一个事件已生效（c03 确认），后一个事件非法 -> 整批拒绝，只含 detail
+    resp = _wl(
+        events=[
+            {"type": "confirm", "candidate_id": "c03", "at_utc": "2026-04-01T10:05:00Z"},
+            {"type": "cancel", "candidate_id": "ghost", "at_utc": "2026-04-01T10:06:00Z"},
+        ]
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert set(body.keys()) == {"detail"}
+
+
+def test_waitlist_trial_422_validation():
+    # 非正席位数 / 保留时长
+    assert _wl(seats=0).status_code == 422
+    assert _wl(seats=-1).status_code == 422
+    assert _wl(invite_ttl_minutes=0).status_code == 422
+    # 编号重复
+    assert _wl(candidates=_WL_CANDIDATES + [_WL_CANDIDATES[0]]).status_code == 422
+    # 空编号 / 空白编号
+    assert _wl(candidates=[{"candidate_id": "  ", "priority": 1,
+                            "registered_at_utc": "2026-04-01T09:00:00Z"}]).status_code == 422
+    # 候补者列表为空
+    assert _wl(candidates=[]).status_code == 422
+    # 报名晚于起始时刻
+    assert _wl(candidates=[{"candidate_id": "a", "priority": 1,
+                            "registered_at_utc": "2026-04-01T10:00:01Z"}]).status_code == 422
+    # 结算早于起始
+    assert _wl(settle_at_utc="2026-04-01T09:59:00Z").status_code == 422
+    # 事件越界（早于起始 / 晚于结算）
+    assert _wl(events=[{"type": "confirm", "candidate_id": "c03",
+                        "at_utc": "2026-04-01T09:59:00Z"}]).status_code == 422
+    assert _wl(events=[{"type": "confirm", "candidate_id": "c03",
+                        "at_utc": "2026-04-01T12:01:00Z"}]).status_code == 422
+    # 事件倒序
+    assert _wl(events=[
+        {"type": "confirm", "candidate_id": "c03", "at_utc": "2026-04-01T10:05:00Z"},
+        {"type": "cancel", "candidate_id": "c01", "at_utc": "2026-04-01T10:04:00Z"},
+    ]).status_code == 422
+    # 非整分钟时刻
+    assert _wl(start_at_utc="2026-04-01T10:00:30Z").status_code == 422
+    assert _wl(events=[{"type": "confirm", "candidate_id": "c03",
+                        "at_utc": "2026-04-01T10:05:30Z"}]).status_code == 422
+    # 非 Z 结尾时刻
+    assert _wl(start_at_utc="2026-04-01T10:00:00+08:00").status_code == 422
+    # 非法事件类型
+    assert _wl(events=[{"type": "noop", "candidate_id": "c03",
+                        "at_utc": "2026-04-01T10:05:00Z"}]).status_code == 422
+    # 缺字段 / 空请求体
+    assert client.post("/waitlist-trial", json={}).status_code == 422
+    assert client.post("/waitlist-trial", json={"seats": 1}).status_code == 422
+
+
+def test_waitlist_trial_registered_at_equal_start_ok():
+    resp = _wl(
+        seats=1,
+        settle_at_utc="2026-04-01T10:20:00Z",
+        candidates=[{"candidate_id": "a", "priority": 1,
+                     "registered_at_utc": "2026-04-01T10:00:00Z"}],
+        events=[],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["candidates"] == [{"candidate_id": "a", "status": "invited"}]
