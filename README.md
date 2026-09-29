@@ -27,11 +27,20 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 撤回只释放目标收款原先核销的金额而不重排其他收款，释放额度可供后续收款使用；
 相同事件号的重放按幂等处理（内容一致只计一次，内容不同整批拒绝），
 撤回不存在或已撤回的收款、以及收款超过剩余应收同样整批拒绝、不返回部分试算。
+`POST /waitlist-seats` 提供限量活动的候补席位一次请求试算：
+起始按优先级、报名时刻、编号字典序邀请至满额，邀请保留整分钟、
+截止当分钟仍可由本人确认、下一分钟自动失效并立即把空位邀请给下一人；
+取消待邀者仅退出候补，取消持邀 / 已确认者释放席位并立即补位；
+自动失效先于同刻事件、同刻事件按输入顺序、已发邀请不撤换，
+非法取消与无有效邀请的确认均整批拒绝、不返回部分试算。
 
-> **本轮变动（v1.1.0）**：新增 `POST /receipt-write-off` 收款核销试算接口与
-> 纯逻辑模块 `app/receivables.py`（Decimal 按分精确运算、原子整批拒绝）；
+> **本轮变动（v1.2.0）**：新增 `POST /waitlist-seats` 候补席位试算接口与
+> 纯逻辑模块 `app/waitlist.py`（整分钟 UTC 时间轴、原子整批拒绝）；
 > 既有接口与行为保持不变。启动方式、健康检查与镜像构建期自检不变
-> （自检额外断言 `/receipt-write-off` 路由已注册）。
+> （自检额外断言 `/waitlist-seats` 路由已注册）。
+>
+> **上一轮（v1.1.0）**：新增 `POST /receipt-write-off` 收款核销试算接口与
+> 纯逻辑模块 `app/receivables.py`（Decimal 按分精确运算、原子整批拒绝）。
 
 ## 快速启动（单条命令）
 
@@ -46,7 +55,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`、`/inventory-allocation`、`/receipt-write-off`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`、`/inventory-allocation`、`/receipt-write-off`、`/waitlist-seats`
 
 ## 配置
 
@@ -884,6 +893,131 @@ docker compose up --build
 撤回缺少 `reversal_of`、`invoices` / `events` 为空或缺失、`NaN` / `Infinity`
 等）统一返回 `422`，详见下节。
 
+### `POST /waitlist-seats`
+
+限量活动按**一次请求**试算候补席位。输入席位数、候补者（编号 / 优先级 /
+报名时刻）、起始时刻、邀请保留分钟数、按时刻非递减排列的确认 / 取消事件
+以及结算时刻。**所有时刻均为整分钟 UTC（Unix 纪元起的整数分钟数）**，
+无日期解析、无夏令时；报名时刻不得晚于起始时刻。处理规则：
+
+- **起始邀请**：按**优先级高（`priority` 数值大）→ 报名早（`registered_minute`
+  小）→ 编号 Unicode 字典序**排序，自队首邀请至满额（候补者不足满额则全部发出）。
+- **保留与失效**：邀请在发出当分钟生效，`deadline_minute = sent_minute +
+  hold_minutes`；**截止当分钟仍可由本人确认，截止的下一分钟
+  （`deadline_minute + 1`）自动失效**。失效者退出候补，其空位**立即**邀请
+  当时队首的下一人（新邀请同分钟发出，保留时长重新计算）。
+- **取消**：取消**待邀者**只使其退出候补队列，不释放席位；取消**持邀或
+  已确认者**立即释放席位 / 了结邀请并马上补位给下一人。**已发出的邀请不撤换**
+  （补位只发给新的人，不影响其他持邀者）。
+- **确认**：仅在本人当时持有**有效邀请**（已发出、未确认、未取消、未失效）
+  时合法；确认后占座。已确认者之后再取消，其邀请结果仍记为 `confirmed`。
+- **同刻次序**：每分钟先处理该分钟的**全部自动失效**，再**按输入顺序**处理
+  该分钟的事件；事件时刻非递减（同刻多个事件顺序即输入顺序）。
+- **结算**：处理完不晚于结算时刻的全部失效与事件后输出。结算当分钟邀请仍可
+  确认；邀请的自动失效落在结算之后则不再发生，结算时仍持邀者记为 `invited`。
+- 编号重复、非正席位数或保留时长、报名晚于起始、结算早于起始、事件越界或
+  倒序等输入问题返回 `422`；**取消未知或已退出对象、无有效邀请的确认**为
+  业务冲突，返回 `409`，二者均**整批拒绝、不返回任何部分试算**。
+
+请求体：
+
+```json
+{
+  "seats": 2,
+  "hold_minutes": 10,
+  "start_minute": 29538720,
+  "settle_minute": 29538731,
+  "candidates": [
+    {"id": "alice", "priority": 10, "registered_minute": 29538718},
+    {"id": "bob",   "priority": 5,  "registered_minute": 29538718},
+    {"id": "carol", "priority": 10, "registered_minute": 29538718}
+  ],
+  "events": [
+    {"type": "confirm", "at_minute": 29538725, "candidate_id": "alice"},
+    {"type": "cancel",  "at_minute": 29538730, "candidate_id": "carol"}
+  ]
+}
+```
+
+上例中起始时刻 `29538720` = 2026-03-01T00:00Z（每 +1 为后一分钟）。
+alice 与 carol 同为优先级 10、同时报名，编号字典序 alice 在前，故起始邀请
+alice、carol（bob 待邀）；两人邀请截止均为 `+10`。alice 于第 5 分钟确认；
+carol 在截止当分钟取消（持邀取消，席位释放），bob 同分钟获邀（截止
+`+10`，结算时仍有效）。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `seats` | int | 席位数，**正整数**（StrictInt，不接受字符串 / 浮点 / 布尔） |
+| `hold_minutes` | int | 邀请保留分钟数，**正整数**；`deadline = sent + hold_minutes` |
+| `start_minute` | int | 起始时刻（整分钟 UTC，Unix 纪元分钟数） |
+| `settle_minute` | int | 结算时刻（整分钟 UTC），须 ≥ `start_minute` |
+| `candidates` | object[] | 候补者，至少 1 人；`id` 去空白后非空且请求内唯一 |
+| `candidates[].id` | string | 候补者编号（Unicode 字典序参与排序） |
+| `candidates[].priority` | int | 优先级（整数，**数值越大优先级越高**） |
+| `candidates[].registered_minute` | int | 报名时刻（整分钟 UTC），须 ≤ `start_minute` |
+| `events` | object[] | 按时刻**非递减**排列的确认 / 取消事件，可为空数组；同刻按输入顺序 |
+| `events[].type` | string | `confirm`（本人确认）或 `cancel`（取消） |
+| `events[].at_minute` | int | 事件时刻，须落在 `[start_minute, settle_minute]` |
+| `events[].candidate_id` | string | 事件对象编号（去空白后非空） |
+
+响应 `200`（`people` 按输入顺序；`invitations` 按发出先后）：
+
+```json
+{
+  "people": [
+    {"id": "alice", "final_status": "confirmed"},
+    {"id": "bob",   "final_status": "invited"},
+    {"id": "carol", "final_status": "canceled"}
+  ],
+  "invitations": [
+    {"candidate_id": "alice", "sent_minute": 29538720, "deadline_minute": 29538730,
+     "result": "confirmed", "result_minute": 29538725},
+    {"candidate_id": "carol", "sent_minute": 29538720, "deadline_minute": 29538730,
+     "result": "canceled",  "result_minute": 29538730},
+    {"candidate_id": "bob",   "sent_minute": 29538730, "deadline_minute": 29538740,
+     "result": "pending",   "result_minute": null}
+  ],
+  "seats": 2,
+  "hold_minutes": 10,
+  "start_minute": 29538720,
+  "settle_minute": 29538731
+}
+```
+
+`final_status` 取值：
+
+| 值 | 含义 |
+| --- | --- |
+| `waiting` | 仍在候补队列，始终未获邀 |
+| `invited` | 结算时持有仍有效（未确认、未取消、未失效）的邀请 |
+| `confirmed` | 已确认占座，结算时仍持有（确认后未再取消） |
+| `expired` | 邀请到截止下一分钟未确认，自动失效退出 |
+| `canceled` | 本人取消（无论取消时处于待邀、持邀还是已确认），已退出 |
+
+邀请 `result` 取值：`pending`（结算时仍有效，`result_minute` 为 `null`）、
+`confirmed`（本人确认，`result_minute` 为确认分钟；确认后再取消仍保留
+`confirmed`）、`expired`（自动失效）、`canceled`（持邀期间本人取消）。
+待邀阶段即取消的人**从未获邀，不出现在 `invitations` 中**。
+
+业务冲突时返回 `409 Conflict`，响应体只含 `detail`，**不含任何试算结果**
+（整批原子拒绝）。两类错误：
+
+```json
+// 确认时本人无有效邀请：
+// unknown_candidate / not_invited / already_confirmed / expired / canceled
+{"detail": {"error": "confirm_without_invitation", "event_index": 0,
+            "at_minute": 29538731, "candidate_id": "alice", "reason": "expired"}}
+
+// 取消未知编号（not_found）或已退出对象（already_exited）
+{"detail": {"error": "cancel_target_invalid", "event_index": 2,
+            "at_minute": 29538730, "candidate_id": "zoe", "reason": "not_found"}}
+```
+
+`event_index` 为冲突事件在 `events` 数组中的下标（从 0 起）。输入形状 / 取值
+校验失败（席位或保留时长非正、整分钟字段不是整数、编号空白或重复、候补者
+为空、报名晚于起始、结算早于起始、事件时刻越界或倒序、`type` 非法、
+缺失必填字段等）统一返回 `422`，详见下节。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -921,6 +1055,15 @@ docker compose up --build
   收款超额、撤回目标不存在或已撤回、相同事件号重放内容不同均不是 422 而是
   `409`，整批拒绝且不返回部分试算；相同事件号且内容一致的重放是合法幂等
   重放（事件号允许重复），返回 `200` 且只计一次
+- `/waitlist-seats`：`seats` / `hold_minutes` 非正（≤ 0）、任一整分钟字段
+  不是整数（浮点 / 数字字符串 / 布尔 / null，StrictInt 不做隐式转换）、
+  `candidates` 为空或缺失、候补者编号为空白或重复、
+  `registered_minute` 晚于 `start_minute`、`settle_minute` 早于
+  `start_minute`、事件 `at_minute` 越出 `[start_minute, settle_minute]`
+  或相对前一事件倒序（同刻相等合法）、事件缺少 `type` 或 `type` 不是
+  `confirm` / `cancel`、事件对象编号为空白。
+  取消未知或已退出对象、无有效邀请的确认不是 422 而是 `409`，
+  整批拒绝且不返回部分试算（事件为空列表、候补者多于席位数均为合法输入）
 
 ## curl 请求示例
 
@@ -977,6 +1120,25 @@ curl -s http://localhost:8000/receipt-write-off \
       {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
       {"type": "receipt",  "event_id": "R2", "amount": "22.00"}
     ]}'
+
+# /waitlist-seats：2 席；alice 第 5 分钟确认，carol 截止当分钟取消，
+# bob 同分钟补位获邀（时刻为整分钟 UTC，起始 = 2026-03-01T00:00Z）
+curl -s http://localhost:8000/waitlist-seats \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "seats": 2,
+    "hold_minutes": 10,
+    "start_minute": 29538720,
+    "settle_minute": 29538731,
+    "candidates": [
+      {"id": "alice", "priority": 10, "registered_minute": 29538718},
+      {"id": "bob",   "priority": 5,  "registered_minute": 29538718},
+      {"id": "carol", "priority": 10, "registered_minute": 29538718}
+    ],
+    "events": [
+      {"type": "confirm", "at_minute": 29538725, "candidate_id": "alice"},
+      {"type": "cancel",  "at_minute": 29538730, "candidate_id": "carol"}
+    ]}'
 ```
 
 ## 判定原理
@@ -1002,6 +1164,16 @@ curl -s http://localhost:8000/receipt-write-off \
 签名相同则跳过、不同则整批失败。金额全程以 `Decimal` 运算并以 **0.01（分）**
 为最小刻度，整数金额序列化为 JSON 整数、否则序列化为两位以内小数。
 
+候补席位试算（`/waitlist-seats`）把候补者按
+`(-优先级, 报名时刻, 编号)` 稳定排序为候补队列，起始按席位数发邀并把发出的
+邀请登记到**自动失效最小堆**（失效分钟 = 截止分钟 + 1）。随后时间按整分钟
+推进：每分钟先弹出该分钟的全部失效邀请（仅仍持邀者失效，已确认 / 已取消的
+堆条目惰性跳过），失效即退出、空位数加一并马上从队首惰性取仍在候补者补位；
+再按输入顺序处理该分钟事件——确认要求本人当前恰持有效邀请，取消待邀者仅
+出队、取消持邀 / 已确认者释放空位并立即补位。任一冲突立即整批失败、丢弃全部
+模拟状态（不返回部分结果）。结算时刻之后的失效不再处理，结算时仍有效的邀请
+结果记为 `pending`。每人至多获邀一次，邀请列表按发出先后保留。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -1014,11 +1186,12 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/inventory-allocation、/receipt-write-off 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/inventory-allocation、/receipt-write-off、/waitlist-seats 与 /health
   models.py      # 请求/响应模型与 422 校验规则
   scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 共同在岗区间交集与交接链最短路
   inventory.py   # FEFO 批次分配：按 (失效日期, 批次号) 贪心扣减 + 库存不足整批拒绝
   receivables.py # 收款核销试算：按 (到期日, 发票号) 顺序填补 + 撤回仅释放原核销额 + 幂等重放 + 超额/非法撤回/重放冲突整批拒绝（Decimal 按分精确运算）
+  waitlist.py    # 候补席位试算：(-优先级,报名时刻,编号) 邀请至满额 + 截止下一分钟失效最小堆 + 失效/取消立即补位 + 自动失效先于同刻事件 + 非法取消/无邀请确认整批拒绝（整分钟 UTC）
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

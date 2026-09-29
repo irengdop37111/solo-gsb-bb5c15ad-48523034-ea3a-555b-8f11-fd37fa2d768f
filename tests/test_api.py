@@ -2946,3 +2946,452 @@ def test_write_off_non_finite_amount_422():
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422, token
+
+# ---------------------------------------------------------------------------
+# /waitlist-seats：限量活动候补席位试算
+# ---------------------------------------------------------------------------
+
+# 起始时刻取 30_000_000（整分钟 UTC）；4 名候补者，2 席，保留 10 分钟
+_WL_BASE = {
+    "seats": 2,
+    "hold_minutes": 10,
+    "start_minute": 30_000_000,
+    "settle_minute": 30_000_100,
+    "candidates": [
+        {"id": "alice", "priority": 10, "registered_minute": 29_999_990},
+        {"id": "bob",   "priority": 5,  "registered_minute": 29_999_995},
+        {"id": "carol", "priority": 10, "registered_minute": 29_999_990},
+        {"id": "dave",  "priority": 1,  "registered_minute": 29_999_900},
+    ],
+    "events": [],
+}
+
+
+def _wl(**overrides):
+    payload = {**_WL_BASE, "candidates": list(_WL_BASE["candidates"])}
+    payload.update(overrides)
+    return client.post("/waitlist-seats", json=payload)
+
+
+def test_waitlist_initial_invitation_order_by_priority_signup_id():
+    resp = _wl(settle_minute=30_000_005)  # 早于首次失效
+    assert resp.status_code == 200
+    body = resp.json()
+    # 优先级高（10）先得；alice 与 carol 同优先级同报名，编号字典序 alice 在前
+    assert [i["candidate_id"] for i in body["invitations"]] == ["alice", "carol"]
+    assert {p["id"]: p["final_status"] for p in body["people"]} == {
+        "alice": "invited",
+        "carol": "invited",
+        "bob": "waiting",
+        "dave": "waiting",
+    }
+    inv = body["invitations"][0]
+    assert inv["sent_minute"] == 30_000_000
+    assert inv["deadline_minute"] == 30_000_010
+    assert inv["result"] == "pending"
+    assert inv["result_minute"] is None
+    # 入参原样回显
+    assert body["seats"] == 2
+    assert body["hold_minutes"] == 10
+    assert body["start_minute"] == 30_000_000
+    assert body["settle_minute"] == 30_000_005
+    # 人员按输入顺序返回
+    assert [p["id"] for p in body["people"]] == ["alice", "bob", "carol", "dave"]
+
+
+def test_waitlist_confirm_at_deadline_succeeds_and_next_minute_expires():
+    # alice/carol 0 发邀，截止 10：10 当分钟确认 alice；carol 11 失效，bob 补位
+    resp = _wl(
+        events=[
+            {"type": "confirm", "at_minute": 30_000_010, "candidate_id": "alice"},
+        ],
+        settle_minute=30_000_011,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    by_id = {i["candidate_id"]: i for i in body["invitations"]}
+    assert by_id["alice"]["result"] == "confirmed"
+    assert by_id["alice"]["result_minute"] == 30_000_010
+    assert by_id["carol"]["result"] == "expired"
+    assert by_id["carol"]["result_minute"] == 30_000_011
+    assert by_id["bob"]["sent_minute"] == 30_000_011
+    assert by_id["bob"]["deadline_minute"] == 30_000_021
+    assert by_id["bob"]["result"] == "pending"
+    assert {p["id"]: p["final_status"] for p in body["people"]} == {
+        "alice": "confirmed",
+        "carol": "expired",
+        "bob": "invited",
+        "dave": "waiting",
+    }
+
+
+def test_waitlist_expiry_precedes_same_minute_event():
+    # 11 当分钟：carol 先失效，bob 同分钟获邀并确认
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 1, "registered_minute": 0},
+            {"id": "b", "priority": 0, "registered_minute": 0},
+        ],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=200,
+        events=[{"type": "confirm", "at_minute": 111, "candidate_id": "b"}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    by_id = {i["candidate_id"]: i for i in body["invitations"]}
+    assert by_id["a"]["result"] == "expired"
+    assert by_id["a"]["result_minute"] == 111
+    assert by_id["b"]["sent_minute"] == 111
+    assert by_id["b"]["result"] == "confirmed"
+    assert by_id["b"]["result_minute"] == 111
+
+
+def test_waitlist_cancel_waiting_does_not_free_seat():
+    # bob 待邀取消；alice 失效后补位的是 carol
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 2, "registered_minute": 0},
+            {"id": "b", "priority": 1, "registered_minute": 0},
+            {"id": "c", "priority": 0, "registered_minute": 0},
+        ],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=120,
+        events=[
+            {"type": "cancel", "at_minute": 105, "candidate_id": "b"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    by_id = {i["candidate_id"]: i for i in body["invitations"]}
+    assert "b" not in by_id
+    assert by_id["a"]["result"] == "expired"
+    assert by_id["c"]["sent_minute"] == 111
+    assert {p["id"]: p["final_status"] for p in body["people"]} == {
+        "a": "expired",
+        "b": "canceled",
+        "c": "invited",
+    }
+
+
+def test_waitlist_cancel_invited_releases_and_fills_same_minute():
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 1, "registered_minute": 0},
+            {"id": "b", "priority": 0, "registered_minute": 0},
+        ],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=108,
+        events=[{"type": "cancel", "at_minute": 104, "candidate_id": "a"}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    by_id = {i["candidate_id"]: i for i in body["invitations"]}
+    assert by_id["a"]["result"] == "canceled"
+    assert by_id["a"]["result_minute"] == 104
+    assert by_id["b"]["sent_minute"] == 104
+    assert by_id["b"]["result"] == "pending"
+    assert {p["id"]: p["final_status"] for p in body["people"]} == {
+        "a": "canceled",
+        "b": "invited",
+    }
+
+
+def test_waitlist_cancel_confirmed_keeps_invitation_confirmed():
+    resp = _wl(
+        candidates=[{"id": "a", "priority": 1, "registered_minute": 0}],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=120,
+        events=[
+            {"type": "confirm", "at_minute": 102, "candidate_id": "a"},
+            {"type": "cancel", "at_minute": 105, "candidate_id": "a"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["invitations"][0]["result"] == "confirmed"
+    assert body["invitations"][0]["result_minute"] == 102
+    assert body["people"][0]["final_status"] == "canceled"
+
+
+def test_waitlist_same_minute_events_in_input_order():
+    # 104：b 先取消（待邀退出），a 再取消（持邀释放）；补位跳过 b 给到 c
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 2, "registered_minute": 0},
+            {"id": "b", "priority": 1, "registered_minute": 0},
+            {"id": "c", "priority": 0, "registered_minute": 0},
+        ],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=108,
+        events=[
+            {"type": "cancel", "at_minute": 104, "candidate_id": "b"},
+            {"type": "cancel", "at_minute": 104, "candidate_id": "a"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [i["candidate_id"] for i in body["invitations"]] == ["a", "c"]
+    assert {p["id"]: p["final_status"] for p in body["people"]} == {
+        "a": "canceled",
+        "b": "canceled",
+        "c": "invited",
+    }
+
+
+def test_waitlist_confirm_without_invitation_409_no_partial():
+    # bob 从未获邀就确认
+    resp = _wl(
+        events=[{"type": "confirm", "at_minute": 30_000_005, "candidate_id": "bob"}],
+        settle_minute=30_000_005,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "confirm_without_invitation",
+        "event_index": 0,
+        "at_minute": 30_000_005,
+        "candidate_id": "bob",
+        "reason": "not_invited",
+    }
+    assert "people" not in resp.json()
+    assert "invitations" not in resp.json()
+
+
+def test_waitlist_confirm_after_expiry_409_reason_expired():
+    # hold=10：111 已失效，111 的确认先失效后处理
+    resp = _wl(
+        candidates=[{"id": "a", "priority": 1, "registered_minute": 0}],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=120,
+        events=[{"type": "confirm", "at_minute": 111, "candidate_id": "a"}],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "expired"
+
+
+def test_waitlist_double_confirm_409():
+    resp = _wl(
+        candidates=[{"id": "a", "priority": 1, "registered_minute": 0}],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=120,
+        events=[
+            {"type": "confirm", "at_minute": 101, "candidate_id": "a"},
+            {"type": "confirm", "at_minute": 102, "candidate_id": "a"},
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "confirm_without_invitation"
+    assert detail["reason"] == "already_confirmed"
+    assert detail["event_index"] == 1
+
+
+def test_waitlist_cancel_unknown_candidate_409():
+    resp = _wl(
+        events=[{"type": "cancel", "at_minute": 30_000_005, "candidate_id": "zoe"}],
+        settle_minute=30_000_005,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "cancel_target_invalid",
+        "event_index": 0,
+        "at_minute": 30_000_005,
+        "candidate_id": "zoe",
+        "reason": "not_found",
+    }
+
+
+def test_waitlist_cancel_already_exited_409():
+    # a 于 111 失效退出，112 再取消 -> already_exited
+    resp = _wl(
+        candidates=[{"id": "a", "priority": 1, "registered_minute": 0}],
+        seats=1,
+        hold_minutes=10,
+        start_minute=100,
+        settle_minute=120,
+        events=[{"type": "cancel", "at_minute": 112, "candidate_id": "a"}],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "cancel_target_invalid"
+    assert detail["reason"] == "already_exited"
+
+
+def test_waitlist_non_positive_seats_or_hold_422():
+    assert _wl(seats=0).status_code == 422
+    assert _wl(seats=-3).status_code == 422
+    assert _wl(hold_minutes=0).status_code == 422
+    assert _wl(hold_minutes=-1).status_code == 422
+
+
+def test_waitlist_duplicate_candidate_id_422():
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 1, "registered_minute": 0},
+            {"id": "a", "priority": 0, "registered_minute": 0},
+        ]
+    )
+    assert resp.status_code == 422
+
+
+def test_waitlist_blank_candidate_id_422():
+    resp = _wl(
+        candidates=[{"id": "   ", "priority": 1, "registered_minute": 0}]
+    )
+    assert resp.status_code == 422
+
+
+def test_waitlist_empty_candidates_422():
+    assert _wl(candidates=[]).status_code == 422
+    assert client.post("/waitlist-seats", json={}).status_code == 422
+
+
+def test_waitlist_registration_after_start_422():
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 1, "registered_minute": 30_000_001},
+        ]
+    )
+    assert resp.status_code == 422
+
+    # 恰好等于起始时刻合法
+    resp = _wl(
+        candidates=[
+            {"id": "a", "priority": 1, "registered_minute": 30_000_000},
+        ],
+        settle_minute=30_000_000,
+        events=[],
+    )
+    assert resp.status_code == 200
+
+
+def test_waitlist_settle_before_start_422():
+    resp = _wl(start_minute=100, settle_minute=99)
+    assert resp.status_code == 422
+
+
+def test_waitlist_event_out_of_bounds_422():
+    resp = _wl(
+        events=[{"type": "confirm", "at_minute": 29_999_999, "candidate_id": "alice"}],
+    )
+    assert resp.status_code == 422  # 早于起始
+
+    resp = _wl(
+        events=[{"type": "confirm", "at_minute": 30_000_101, "candidate_id": "alice"}],
+    )
+    assert resp.status_code == 422  # 晚于结算
+
+
+def test_waitlist_events_not_non_decreasing_422():
+    resp = _wl(
+        events=[
+            {"type": "confirm", "at_minute": 30_000_005, "candidate_id": "alice"},
+            {"type": "cancel", "at_minute": 30_000_004, "candidate_id": "bob"},
+        ]
+    )
+    assert resp.status_code == 422
+
+
+def test_waitlist_equal_timestamps_allowed():
+    # 同刻事件合法（顺序即输入顺序）
+    resp = _wl(
+        events=[
+            {"type": "confirm", "at_minute": 30_000_005, "candidate_id": "alice"},
+            {"type": "confirm", "at_minute": 30_000_005, "candidate_id": "carol"},
+        ],
+        settle_minute=30_000_005,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {i["candidate_id"]: i["result"] for i in body["invitations"]} == {
+        "alice": "confirmed",
+        "carol": "confirmed",
+    }
+
+
+def test_waitlist_unknown_event_type_422():
+    resp = _wl(
+        events=[{"type": "revoke", "at_minute": 30_000_005, "candidate_id": "alice"}],
+        settle_minute=30_000_005,
+    )
+    assert resp.status_code == 422
+
+
+def test_waitlist_non_integer_minutes_422():
+    # 整分钟字段不接受浮点 / 数字字符串 / 布尔 / null（StrictInt，不做隐式转换）
+    for bad in (1.5, "30000000", True, None):
+        resp = client.post(
+            "/waitlist-seats",
+            json={
+                "seats": 1,
+                "hold_minutes": 10,
+                "start_minute": bad,
+                "settle_minute": 200,
+                "candidates": [
+                    {"id": "a", "priority": 1, "registered_minute": 0}
+                ],
+                "events": [],
+            },
+        )
+        assert resp.status_code == 422, ("start_minute", bad)
+
+    # priority / registered_minute / at_minute 同样严格
+    resp = client.post(
+        "/waitlist-seats",
+        json={
+            "seats": 1,
+            "hold_minutes": 10,
+            "start_minute": 100,
+            "settle_minute": 200,
+            "candidates": [
+                {"id": "a", "priority": "1", "registered_minute": 0}
+            ],
+            "events": [],
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/waitlist-seats",
+        json={
+            "seats": 1,
+            "hold_minutes": 10,
+            "start_minute": 100,
+            "settle_minute": 200,
+            "candidates": [
+                {"id": "a", "priority": 1, "registered_minute": "0"}
+            ],
+            "events": [],
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/waitlist-seats",
+        json={
+            "seats": 1,
+            "hold_minutes": 10,
+            "start_minute": 100,
+            "settle_minute": 200,
+            "candidates": [
+                {"id": "a", "priority": 1, "registered_minute": 0}
+            ],
+            "events": [
+                {"type": "confirm", "at_minute": 101.0, "candidate_id": "a"}
+            ],
+        },
+    )
+    assert resp.status_code == 422

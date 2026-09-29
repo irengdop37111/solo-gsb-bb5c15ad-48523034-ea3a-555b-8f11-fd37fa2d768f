@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 MAX_RANGE_DAYS = 366
 
@@ -804,3 +804,147 @@ class ReceiptWriteOffResponse(BaseModel):
     @classmethod
     def _coerce(cls, v: object) -> object:
         return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+# ---------------------------------------------------------------------------
+# 限量活动候补席位试算
+# ---------------------------------------------------------------------------
+
+
+class WaitlistCandidateIn(BaseModel):
+    """一名候补者：编号唯一，报名时刻不得晚于起始时刻。"""
+
+    id: str = Field(..., min_length=1, description="候补者编号，非空，请求内唯一")
+    priority: StrictInt = Field(
+        ..., description="优先级（整数，数值越大优先级越高），平局看报名时刻"
+    )
+    registered_minute: StrictInt = Field(
+        ..., description="报名时刻（整分钟 UTC，Unix 纪元分钟数），须 ≤ 起始时刻"
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _strip_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("candidate id must not be empty or whitespace")
+        return v
+
+
+class WaitlistEventIn(BaseModel):
+    """确认 / 取消事件；事件按时刻非递减排列（同刻按输入顺序处理）。"""
+
+    type: Literal["confirm", "cancel"] = Field(
+        ..., description="事件类型：confirm（本人确认）/ cancel（取消）"
+    )
+    at_minute: StrictInt = Field(
+        ...,
+        description=(
+            "事件时刻（整分钟 UTC，Unix 纪元分钟数），"
+            "须落在 [start_minute, settle_minute]，事件之间非递减"
+        ),
+    )
+    candidate_id: str = Field(..., min_length=1, description="事件对象编号（非空）")
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _strip_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("candidate id must not be empty or whitespace")
+        return v
+
+
+class WaitlistTrialRequest(BaseModel):
+    seats: StrictInt = Field(..., ge=1, description="席位数（正整数）")
+    hold_minutes: StrictInt = Field(
+        ..., ge=1, description="邀请保留分钟数（正整数）；截止当分钟仍可确认"
+    )
+    start_minute: StrictInt = Field(
+        ..., description="活动起始时刻（整分钟 UTC，Unix 纪元分钟数）"
+    )
+    settle_minute: StrictInt = Field(
+        ..., description="结算时刻（整分钟 UTC，Unix 纪元分钟数），须 ≥ 起始时刻"
+    )
+    candidates: list[WaitlistCandidateIn] = Field(
+        ..., min_length=1, description="候补者，至少 1 人；编号不得重复"
+    )
+    events: list[WaitlistEventIn] = Field(
+        default_factory=list,
+        description=(
+            "按时刻非递减排列的确认 / 取消事件（同刻按输入顺序）；"
+            "自动失效先于同刻事件。允许为空列表"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "WaitlistTrialRequest":
+        ids = [c.id for c in self.candidates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("candidate ids must be unique")
+        if self.settle_minute < self.start_minute:
+            raise ValueError(
+                "settle_minute must be on or after start_minute"
+            )
+        late = [c.id for c in self.candidates if c.registered_minute > self.start_minute]
+        if late:
+            raise ValueError(
+                f"registered_minute must be on or before start_minute: {late[0]!r}"
+            )
+        for i, ev in enumerate(self.events):
+            if ev.at_minute < self.start_minute or ev.at_minute > self.settle_minute:
+                raise ValueError(
+                    f"events[{i}].at_minute {ev.at_minute} out of bounds "
+                    f"[{self.start_minute}, {self.settle_minute}]"
+                )
+            if i > 0 and ev.at_minute < self.events[i - 1].at_minute:
+                raise ValueError(
+                    f"events[{i}].at_minute {ev.at_minute} is earlier than "
+                    f"the previous event at {self.events[i - 1].at_minute}; "
+                    "events must be non-decreasing"
+                )
+        return self
+
+
+class InvitationOut(BaseModel):
+    candidate_id: str
+    sent_minute: int = Field(..., description="邀请发出时刻（整分钟 UTC）")
+    deadline_minute: int = Field(
+        ..., description="邀请截止时刻（含，当分钟仍可确认）；下一分钟自动失效"
+    )
+    result: Literal["pending", "confirmed", "expired", "canceled"] = Field(
+        ...,
+        description=(
+            "邀请结果：pending=结算时仍有效；confirmed=本人已确认；"
+            "expired=自动失效；canceled=持邀期间本人取消"
+        ),
+    )
+    result_minute: int | None = Field(
+        ..., description="结果落定时刻（整分钟 UTC）；pending 时为 null"
+    )
+
+
+class PersonStatusOut(BaseModel):
+    id: str
+    final_status: Literal["waiting", "invited", "confirmed", "expired", "canceled"] = (
+        Field(
+            ...,
+            description=(
+                "最终状态：waiting=仍在候补未获邀；invited=结算时持有效邀请；"
+                "confirmed=已确认占座；expired=邀请失效退出；canceled=本人取消退出"
+            ),
+        )
+    )
+
+
+class WaitlistTrialResponse(BaseModel):
+    people: list[PersonStatusOut] = Field(
+        ..., description="每名候补者的最终状态，按输入顺序返回"
+    )
+    invitations: list[InvitationOut] = Field(
+        ..., description="全部已发出的邀请，按发出时刻顺序（同刻按邀请发出先后）"
+    )
+    seats: int = Field(..., description="席位数（原样回显）")
+    hold_minutes: int = Field(..., description="邀请保留分钟数（原样回显）")
+    start_minute: int = Field(..., description="起始时刻（原样回显）")
+    settle_minute: int = Field(..., description="结算时刻（原样回显）")

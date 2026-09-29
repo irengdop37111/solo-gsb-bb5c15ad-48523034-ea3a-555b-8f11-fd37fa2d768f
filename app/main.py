@@ -46,6 +46,10 @@ from .models import (
     StaffingGapOut,
     StaffingGapsRequest,
     StaffingGapsResponse,
+    InvitationOut,
+    PersonStatusOut,
+    WaitlistTrialRequest,
+    WaitlistTrialResponse,
     WriteOffLineOut,
 )
 from .receivables import (
@@ -53,6 +57,12 @@ from .receivables import (
     InvoiceInput,
     WriteOffRejected,
     simulate as simulate_write_off,
+)
+from .waitlist import (
+    CandidateInput,
+    Event as WaitlistEvent,
+    TrialRejected,
+    simulate as simulate_waitlist,
 )
 from .scheduler import (
     common_free_slots,
@@ -69,7 +79,7 @@ from .scheduler import (
 
 app = FastAPI(
     title="Civil Schedule Expander",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "基于标准库 zoneinfo 的民用日程展开 API："
         "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
@@ -85,6 +95,12 @@ app = FastAPI(
         "收款按到期日、发票号顺序填补未结金额、可拆到多张发票，"
         "撤回仅释放原收款核销额且不重排其他收款，支持幂等重放，"
         "任何业务冲突均整批拒绝、不返回部分试算。"
+        "另提供 /waitlist-seats 限量活动候补席位试算："
+        "起始按优先级、报名时刻、编号字典序邀请至满额，"
+        "邀请保留整分钟、截止当分钟可确认、下一分钟自动失效并立即补位，"
+        "取消待邀者仅退出、取消持邀 / 已确认者释放席位立即补位，"
+        "自动失效先于同刻事件、同刻事件按输入顺序、已发邀请不撤换，"
+        "任何非法取消 / 无有效邀请的确认均整批拒绝、不返回部分试算。"
     ),
 )
 
@@ -537,4 +553,61 @@ def receipt_write_off(req: ReceiptWriteOffRequest) -> ReceiptWriteOffResponse | 
             for row in result.invoices
         ],
         total_written_off=result.total_written_off,
+    )
+
+
+@app.post(
+    "/waitlist-seats",
+    response_model=WaitlistTrialResponse,
+    summary="试算限量活动候补席位的邀请、确认、失效与取消",
+)
+def waitlist_seats(
+    req: WaitlistTrialRequest,
+) -> WaitlistTrialResponse | JSONResponse:
+    # 纯逻辑模块按整分钟时间轴推进；自动失效先于同刻事件、同刻事件按
+    # 输入顺序，非法取消 / 无有效邀请确认整批拒绝（409）不返回部分试算
+    try:
+        result = simulate_waitlist(
+            seats=req.seats,
+            hold_minutes=req.hold_minutes,
+            start_minute=req.start_minute,
+            settle_minute=req.settle_minute,
+            candidates=[
+                CandidateInput(
+                    id=c.id,
+                    priority=c.priority,
+                    registered_minute=c.registered_minute,
+                )
+                for c in req.candidates
+            ],
+            events=[
+                WaitlistEvent(
+                    at_minute=ev.at_minute,
+                    kind=ev.type,
+                    candidate_id=ev.candidate_id,
+                )
+                for ev in req.events
+            ],
+        )
+    except TrialRejected as exc:
+        return JSONResponse(status_code=409, content={"detail": exc.detail()})
+    return WaitlistTrialResponse(
+        people=[
+            PersonStatusOut(id=p.id, final_status=p.final_status)
+            for p in result.people
+        ],
+        invitations=[
+            InvitationOut(
+                candidate_id=inv.candidate_id,
+                sent_minute=inv.sent_minute,
+                deadline_minute=inv.deadline_minute,
+                result=inv.result,
+                result_minute=inv.result_minute,
+            )
+            for inv in result.invitations
+        ],
+        seats=req.seats,
+        hold_minutes=req.hold_minutes,
+        start_minute=req.start_minute,
+        settle_minute=req.settle_minute,
     )
